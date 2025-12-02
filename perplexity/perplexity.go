@@ -17,7 +17,7 @@ const (
 )
 
 const (
-	CLAUDE = "mixtral-8x7b-instruct"  // Non-online model that might be available
+	CLAUDE = "claude-sonnet-4-29339"  // Use Claude model which is commonly available
 )
 
 var (
@@ -29,9 +29,11 @@ var (
 	}
 
 	ALL_MODELS = []string{
-		"mixtral-8x7b-instruct",
-		"pplx-7b-chat",
-		"pplx-70b-chat",
+		"claude-sonnet-4-29339",
+		"claude-opus-4-29339",
+		"gpt-4o",
+		"gemini-2.0-flash-exp",
+		"gemini-2.0-pro-exp",
 	}
 )
 
