@@ -2,28 +2,22 @@ package perplexity
 
 import (
 	"bytes"
-	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/gorilla/websocket"
 	"io"
-	"log"
-	"math/rand"
 	"net/http"
-	"net/http/cookiejar"
 	"time"
 )
 
 const (
-	apiURL    = "https://labs-api.perplexity.ai/socket.io/"
-	wsURL     = "wss://labs-api.perplexity.ai/socket.io/"
-	userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0"
+	apiURL    = "https://api.perplexity.ai/chat/completions"
+	userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 )
 
 const (
-	CLAUDE = "claude-3-haiku-20240307"
+	CLAUDE = "mixtral-8x7b-instruct"  // Non-online model that might be available
 )
 
 var (
@@ -35,60 +29,55 @@ var (
 	}
 
 	ALL_MODELS = []string{
-		"sonar-small-online",
-		"sonar-medium-online",
-		"sonar-small-chat",
-		"sonar-medium-chat",
-		"claude-3-haiku-20240307",
-		"codellama-70b-instruct",
-		"mistral-7b-instruct",
-		"llava-v1.5-7b-wrapper",
-		"llava-v1.6-34b",
 		"mixtral-8x7b-instruct",
-		"mistral-medium",
-		"gemma-2b-it",
-		"gemma-7b-it",
-		"related",
+		"pplx-7b-chat",
+		"pplx-70b-chat",
 	}
 )
 
 type ChatClient struct {
-	t                string
-	sid              string
 	client           *http.Client
-	jar              *cookiejar.Jar
 	History          []Message
-	websocket        *websocket.Conn
-	receive          chan string
-	ctx              context.Context
-	cancel           context.CancelFunc
 	debug            bool
 	conversationMode bool
+	apiKey           string
+}
+
+// Add a struct for the API response
+type APIResponse struct {
+	ID      string `json:"id"`
+	Model   string `json:"model"`
+	Created int64  `json:"created"`
+	Choices []struct {
+		Index   int     `json:"index"`
+		Message Message `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
 }
 
 func NewChatClient(debug bool, conversationMode bool) *ChatClient {
-	ctx, cancel := context.WithCancel(context.Background())
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		log.Println("unable to create cookie jar:", err)
-	}
 	return &ChatClient{
-		t: fmt.Sprintf("%08x", rand.Uint32()),
 		client: &http.Client{
 			Transport: &http.Transport{
 				TLSClientConfig: tlsConfig,
 			},
-			Timeout: time.Second * 25,
-			Jar:     jar,
+			Timeout: time.Second * 60,
 		},
-		jar:              jar,
 		History:          []Message{},
-		receive:          make(chan string, 1),
 		debug:            debug,
-		ctx:              ctx,
-		cancel:           cancel,
 		conversationMode: conversationMode,
+		apiKey:           "", // Will need to set this via environment variable or config
 	}
+}
+
+// SetAPIKey allows setting the API key externally
+func (c *ChatClient) SetAPIKey(apiKey string) {
+	c.apiKey = apiKey
 }
 
 func (c *ChatClient) Backtrack() error {
@@ -99,241 +88,122 @@ func (c *ChatClient) Backtrack() error {
 	return nil
 }
 
-func (c *ChatClient) ReadForever() error {
-	for {
-		select {
-		case <-c.ctx.Done():
-			return c.ctx.Err()
-		default:
-			_, message, err := c.websocket.ReadMessage()
-			if err != nil {
-				return err
-			}
-			str := string(message)
-			if c.debug {
-				log.Println("[RECV] Received from perplexity labs: ", str)
-			}
-
-			switch {
-			case str == "2":
-				if err := c.websocket.WriteMessage(websocket.TextMessage, []byte("3")); err != nil {
-					return err
-				}
-			case len(str) < 2 || str[:2] != "42":
-				return fmt.Errorf("unexpected message: %s", str)
-			default:
-				var ex []interface{}
-				if err := json.Unmarshal([]byte(str[2:]), &ex); err != nil {
-					return err
-				}
-
-				if len(ex) != 2 {
-					return fmt.Errorf("unexpected JSON structure: %v", ex)
-				}
-
-				_, ok := ex[0].(string)
-				if !ok {
-					return errors.New("unexpected type for the first element")
-				}
-
-				outputData, ok := ex[1].(map[string]interface{})
-				if !ok {
-					return errors.New("unexpected type for the second element")
-				}
-
-				var response Response
-				mrs, err := json.Marshal(outputData)
-				if err != nil {
-					return err
-				}
-				err = json.Unmarshal(mrs, &response)
-				if err != nil {
-					return err
-				}
-
-				if response.Final && response.Status == "completed" {
-					c.History = append(c.History, Message{
-						Role:     "assistant",
-						Content:  response.Output,
-						Priority: 0,
-					})
-					if c.conversationMode {
-						fmt.Println(fmt.Sprintf("\r\nAssistant:\r\n %s\r\n", response.Output))
-					}
-					c.receive <- response.Output
-				}
-			}
-		}
-	}
-}
-
 func (c *ChatClient) Connect() error {
-	sid, err := c.getSessionID()
-	if err != nil {
-		return err
+	// Check if API key is set
+	if c.apiKey == "" {
+		return errors.New("API key not set. Please set your Perplexity API key using PPLX_API_KEY environment variable or via SetAPIKey method")
 	}
-	c.sid = sid
-	if err := c.postData(); err != nil {
-		return err
-	}
-
-	if err := c.getData(); err != nil {
-		return err
-	}
-
-	c.websocket, err = c.connectWebSocket()
-	if err != nil {
-		return err
-	}
-
-	if c.debug {
-		log.Println("Connected to websocket")
-	}
-	if err := c.websocket.WriteMessage(websocket.TextMessage, []byte("2probe")); err != nil {
-		return err
-	}
-	_, message, err := c.websocket.ReadMessage()
-	if err != nil {
-		return err
-	}
-	if string(message) != "3probe" {
-		return fmt.Errorf("unexpected response: %s", message)
-	}
-
-	if err := c.websocket.WriteMessage(websocket.TextMessage, []byte("5")); err != nil {
-		return err
-	}
-	_, message, err = c.websocket.ReadMessage()
-	if err != nil {
-		return err
-	}
-	if string(message) != "6" {
-		return fmt.Errorf("unexpected response: %s", message)
-	}
-	go c.ReadForever()
 	return nil
 }
 
 func (c *ChatClient) Close() error {
-	c.cancel()
-	close(c.receive)
-	if err := c.websocket.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")); err != nil {
-		return err
-	}
-	return c.websocket.Close()
+	// No explicit close needed for HTTP client
+	return nil
 }
 
 func (c *ChatClient) ReceiveMessage(timeout time.Duration) (string, error) {
-	select {
-	case msg := <-c.receive:
-		return msg, nil
-	case <-time.After(timeout):
-		return "", errors.New("timeout waiting for message")
-	}
+	// This method doesn't make sense in the new HTTP-based API,
+	// but we keep it for compatibility with the existing interface
+	// In a real implementation, responses are immediate with HTTP
+	return "", errors.New("ReceiveMessage not supported in HTTP API mode. Use SendMessage which returns the response directly")
 }
 
 func (c *ChatClient) SendMessage(message string, model string) error {
 	if c.conversationMode {
 		fmt.Println(fmt.Sprintf("\r\nUser:\r\n %s\r\n", message))
 	}
-	c.History = append(c.History, Message{
-		Role:     "user",
-		Content:  message,
-		Priority: 0,
-	})
+
+	// Add user message to history
+	userMessage := Message{
+		Role:    "user",
+		Content: message,
+	}
+	c.History = append(c.History, userMessage)
+
+	// Prepare request payload
 	req := Request{
-		Version:  "2.5",
-		Source:   "default",
 		Model:    model,
 		Messages: c.History,
-		Timezone: "Europe/Athens",
+		Stream:   false, // For simplicity, non-streaming for now
 	}
 
-	x, err := json.Marshal(req)
+	// Convert to the format expected by the API
+	apiReq := map[string]interface{}{
+		"model":    req.Model,
+		"messages": req.Messages,
+	}
+
+	jsonData, err := json.Marshal(apiReq)
 	if err != nil {
 		return err
 	}
-	if c.debug {
-		log.Println("[SEND] Sending message to perplexity labs: ", string(x))
-	}
-	if err := c.websocket.WriteMessage(websocket.TextMessage, []byte("42[\"perplexity_labs\","+string(x)+"]")); err != nil {
-		return err
-	}
 
-	return nil
-}
-
-func (c *ChatClient) getSessionID() (string, error) {
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s?EIO=4&transport=polling&t=%s", apiURL, c.t), nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Add("User-Agent", userAgent)
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	read, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	skippedStr := string(read)[1:]
-	var data struct {
-		Sid string `json:"sid"`
-	}
-
-	if err := json.NewDecoder(bytes.NewReader([]byte(skippedStr))).Decode(&data); err != nil {
-		return "", err
-	}
-
-	return data.Sid, nil
-}
-
-func (c *ChatClient) postData() error {
-	postData := []byte(`40{"jwt":"anonymous-ask-user"}`)
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s?EIO=4&transport=polling&t=%s&sid=%s", apiURL, c.t, c.sid), bytes.NewReader(postData))
+	// Create HTTP request
+	httpReq, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return err
 	}
-	req.Header.Add("User-Agent", userAgent)
-	resp, err := c.client.Do(req)
+
+	// Set headers
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	httpReq.Header.Set("User-Agent", userAgent)
+
+	// Make the API call
+	resp, err := c.client.Do(httpReq)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	return nil
-}
-
-func (c *ChatClient) getData() error {
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s?EIO=4&transport=polling&t=%s&sid=%s", apiURL, c.t, c.sid), nil)
+	// Read response
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
-	req.Header.Add("User-Agent", userAgent)
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return err
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(respBody))
 	}
-	defer resp.Body.Close()
+
+	// Parse response
+	var apiResponse APIResponse
+	if err := json.Unmarshal(respBody, &apiResponse); err != nil {
+		return fmt.Errorf("error unmarshaling API response: %v", err)
+	}
+
+	if len(apiResponse.Choices) == 0 {
+		return errors.New("no choices returned in API response")
+	}
+
+	// Get the assistant's response
+	assistantResponse := apiResponse.Choices[0].Message
+
+	// Add assistant response to history
+	c.History = append(c.History, assistantResponse)
+
+	if c.conversationMode {
+		fmt.Println(fmt.Sprintf("\r\nAssistant:\r\n %s\r\n", assistantResponse.Content))
+	}
 
 	return nil
 }
 
-func (c *ChatClient) connectWebSocket() (*websocket.Conn, error) {
-	dialer := websocket.Dialer{
-		TLSClientConfig: tlsConfig,
-		Jar:             c.jar,
+// New method to get response directly instead of using ReceiveMessage
+func (c *ChatClient) GetLastResponse() string {
+	if len(c.History) > 0 {
+		// Return the last message which should be the assistant's response
+		return c.History[len(c.History)-1].Content
 	}
-	conn, _, err := dialer.Dial(fmt.Sprintf("%s?EIO=4&transport=websocket&sid=%s", wsURL, c.sid), http.Header{
-		"User-Agent": []string{userAgent},
-	})
-	if err != nil {
-		return nil, err
-	}
+	return ""
+}
 
-	return conn, nil
+// Updated Request struct to match OpenAI/Perplexity API format
+type Request struct {
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+	Stream   bool      `json:"stream,omitempty"`
+	MaxTokens *int     `json:"max_tokens,omitempty"`
+	Temperature *float64 `json:"temperature,omitempty"`
+	TopP *float64      `json:"top_p,omitempty"`
 }

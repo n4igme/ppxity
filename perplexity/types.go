@@ -10,12 +10,5 @@ type Response struct {
 type Message struct {
 	Role     string `json:"role"`
 	Content  string `json:"content"`
-	Priority int    `json:"priority"`
-}
-type Request struct {
-	Version  string    `json:"version"`
-	Source   string    `json:"source"`
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Timezone string    `json:"timezone"`
+	Priority int    `json:"priority,omitempty"` // Only used in the old socket.io API
 }
